@@ -6,6 +6,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <wincrypt.h>
+#include <fstream>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "Advapi32.lib")
@@ -31,7 +32,6 @@ void print_aes_plain(HCRYPTKEY hKey) {
     std::vector<BYTE> blob(len);
     if (CryptExportKey(hKey, 0, PLAINTEXTKEYBLOB, 0, blob.data(), &len)) {
         std::cout << "Clé AES 256 bits (brute):" << std::endl;
-        // L'entête fait 16 octets, la clé brute commence à l'offset 16
         for (size_t i = 16; i < blob.size(); ++i) {
             printf("%02X", blob[i]);
         }
@@ -47,7 +47,6 @@ struct CryptoCtx {
     HCRYPTKEY hSession = 0;
 };
 
-// Génère un contexte avec une clé RSA 2048 bits
 bool crypto_init(CryptoCtx& ctx) {
     if (!CryptAcquireContext(&ctx.hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
         return false;
@@ -56,7 +55,6 @@ bool crypto_init(CryptoCtx& ctx) {
     return true;
 }
 
-// Export de la clé publique RSA (en blob binaire)
 bool export_rsa_pubkey(CryptoCtx& ctx, std::vector<BYTE>& blob) {
     DWORD len = 0;
     if (!CryptExportKey(ctx.hRSA, 0, PUBLICKEYBLOB, 0, NULL, &len)) return false;
@@ -64,17 +62,14 @@ bool export_rsa_pubkey(CryptoCtx& ctx, std::vector<BYTE>& blob) {
     return CryptExportKey(ctx.hRSA, 0, PUBLICKEYBLOB, 0, blob.data(), &len);
 }
 
-// Import la clé publique du peer
 bool import_rsa_pubkey(CryptoCtx& ctx, const BYTE* blob, DWORD len) {
     return CryptImportKey(ctx.hProv, blob, len, 0, 0, &ctx.hPeerRSA);
 }
 
-// Génère une clé AES 256 bits pour la session
 bool generate_aes_key(CryptoCtx& ctx) {
     return CryptGenKey(ctx.hProv, CALG_AES_256, CRYPT_EXPORTABLE, &ctx.hSession);
 }
 
-// Exporte la clé AES en la chiffrant avec la clé publique du peer (SIMPLEBLOB)
 bool export_aes_for_peer(CryptoCtx& ctx, std::vector<BYTE>& blob) {
     DWORD len = 0;
     if (!CryptExportKey(ctx.hSession, ctx.hPeerRSA, SIMPLEBLOB, 0, NULL, &len)) return false;
@@ -82,12 +77,10 @@ bool export_aes_for_peer(CryptoCtx& ctx, std::vector<BYTE>& blob) {
     return CryptExportKey(ctx.hSession, ctx.hPeerRSA, SIMPLEBLOB, 0, blob.data(), &len);
 }
 
-// Importe la clé AES reçue (chiffrée avec ta clé RSA privée)
 bool import_aes_from_peer(CryptoCtx& ctx, const BYTE* blob, DWORD len) {
     return CryptImportKey(ctx.hProv, blob, len, ctx.hRSA, 0, &ctx.hSession);
 }
 
-// Envoie un "blob" binaire (taille sur 2 octets, puis données)
 bool send_blob(SOCKET sock, const std::vector<BYTE>& blob) {
     uint16_t len = htons((uint16_t)blob.size());
     if (send(sock, (char*)&len, 2, 0) != 2) return false;
@@ -114,10 +107,9 @@ bool recv_blob(SOCKET sock, std::vector<BYTE>& blob) {
     return true;
 }
 
-// Chiffre un message avec AES
 bool aes_encrypt(HCRYPTKEY hKey, const std::string& plaintext, std::vector<BYTE>& ciphertext) {
     DWORD len = (DWORD)plaintext.size();
-    DWORD buflen = len + 32; // Marge
+    DWORD buflen = len + 32;
     ciphertext.resize(buflen);
     memcpy(ciphertext.data(), plaintext.data(), len);
     if (!CryptEncrypt(hKey, 0, TRUE, 0, ciphertext.data(), &len, buflen)) return false;
@@ -125,7 +117,6 @@ bool aes_encrypt(HCRYPTKEY hKey, const std::string& plaintext, std::vector<BYTE>
     return true;
 }
 
-// Déchiffre un message AES
 bool aes_decrypt(HCRYPTKEY hKey, const BYTE* data, DWORD datalen, std::string& plain) {
     std::vector<BYTE> buf(data, data + datalen);
     DWORD len = datalen;
@@ -134,11 +125,69 @@ bool aes_decrypt(HCRYPTKEY hKey, const BYTE* data, DWORD datalen, std::string& p
     return true;
 }
 
-// --- Affichage propre UTF-8 sur console Windows
 void set_utf8_console() {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
     std::ios_base::sync_with_stdio(false);
+}
+
+// ---- Envoi fichier ----
+bool send_file(SOCKET sock, HCRYPTKEY hKey, const std::string& filepath) {
+    std::ifstream f(filepath, std::ios::binary);
+    if (!f) {
+        std::cerr << "[Erreur] Impossible d'ouvrir " << filepath << std::endl;
+        return false;
+    }
+    std::vector<BYTE> data((std::istreambuf_iterator<char>(f)), {});
+    if (data.empty()) {
+        std::cerr << "[Erreur] Fichier vide ou erreur lecture" << std::endl;
+        return false;
+    }
+
+    std::string fname = filepath;
+    size_t pos = fname.find_last_of("/\\");
+    if (pos != std::string::npos)
+        fname = fname.substr(pos + 1);
+
+    std::string header = "FILE:" + fname + ":" + std::to_string(data.size()) + "\n";
+
+    std::vector<BYTE> crypted;
+    std::vector<BYTE> to_encrypt(header.begin(), header.end());
+    to_encrypt.insert(to_encrypt.end(), data.begin(), data.end());
+
+    if (!aes_encrypt(hKey, std::string(to_encrypt.begin(), to_encrypt.end()), crypted)) {
+        std::cerr << "Erreur chiffrement fichier" << std::endl;
+        return false;
+    }
+    if (!send_blob(sock, crypted)) {
+        std::cerr << "Erreur envoi fichier" << std::endl;
+        return false;
+    }
+    std::cout << "[Fichier envoyé: " << fname << " (" << data.size() << " octets)]\n";
+    return true;
+}
+
+// -- Ajoute un suffixe si fichier existe déjà --
+std::string get_unique_filename(const std::string& base) {
+    std::ifstream test(base.c_str(), std::ios::binary);
+    if (!test) return base; // Pas de collision
+
+    std::string name = base;
+    std::string ext;
+    size_t dot = base.find_last_of('.');
+    if (dot != std::string::npos) {
+        name = base.substr(0, dot);
+        ext = base.substr(dot); // includes the dot
+    }
+    int idx = 1;
+    std::string candidate;
+    do {
+        candidate = name + "_" + std::to_string(idx) + ext;
+        std::ifstream test2(candidate.c_str(), std::ios::binary);
+        if (!test2) break;
+        idx++;
+    } while (true);
+    return candidate;
 }
 
 // --- Thread de réception ---
@@ -151,6 +200,26 @@ void receive_loop(SOCKET sock, HCRYPTKEY hAES) {
         }
         std::string plain;
         if (aes_decrypt(hAES, buf.data(), (DWORD)buf.size(), plain)) {
+            // Détection fichier (pas de starts_with en C++14)
+            if (plain.compare(0, 5, "FILE:") == 0) {
+                size_t p1 = plain.find(':', 5);
+                size_t p2 = plain.find(':', p1 + 1);
+                size_t p3 = plain.find('\n', p2 + 1);
+                if (p1 != std::string::npos && p2 != std::string::npos && p3 != std::string::npos) {
+                    std::string fname = plain.substr(5, p1 - 5);
+                    size_t filesize = std::stoul(plain.substr(p1 + 1, p2 - p1 - 1));
+                    std::string dest_name = get_unique_filename(fname);
+                    std::ofstream out(dest_name.c_str(), std::ios::binary);
+                    if (out) {
+                        out.write(plain.data() + p3 + 1, plain.size() - p3 - 1);
+                        std::cout << "\n[Fichier reçu: " << fname << " (" << filesize << " octets) => enregistré sous: " << dest_name << "]\nVous: ";
+                    }
+                    else {
+                        std::cerr << "[Erreur ouverture fichier pour écriture: " << dest_name << "]\nVous: ";
+                    }
+                    continue;
+                }
+            }
             std::cout << "\nAutre: " << plain << std::endl << "Vous: ";
         }
     }
@@ -159,14 +228,12 @@ void receive_loop(SOCKET sock, HCRYPTKEY hAES) {
 int main() {
     set_utf8_console();
 
-    // -- Initialisation Winsock --
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         std::cerr << "Echec WSAStartup\n";
         return 1;
     }
 
-    // -- Récupération IP locale --
     char hostname[256];
     if (gethostname(hostname, sizeof(hostname)) == SOCKET_ERROR) {
         std::cerr << "Erreur gethostname\n";
@@ -187,7 +254,6 @@ int main() {
     freeaddrinfo(res);
     std::cout << "Ton IP locale (pour le peer sur le même réseau) : " << ipstr << std::endl;
 
-    // -- Saisie des paramètres peer --
     int my_port = 0;
     std::cout << "Port d'écoute local ? ";
     std::cin >> my_port;
@@ -200,7 +266,6 @@ int main() {
     std::cout << "Port du peer à contacter ? ";
     std::cin >> peer_port; std::cin.ignore();
 
-    // -- Préparation serveur local --
     SOCKET server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd == INVALID_SOCKET) { std::cerr << "Erreur socket\n"; return 1; }
     sockaddr_in local_addr{};
@@ -215,7 +280,6 @@ int main() {
         std::cerr << "Erreur listen\n"; closesocket(server_fd); WSACleanup(); return 1;
     }
 
-    // -- Connexion peer (mode client ou serveur) --
     SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET) {
         std::cerr << "Erreur socket client\n";
@@ -243,14 +307,12 @@ int main() {
         std::cout << "Connecté en tant que client !" << std::endl;
     }
 
-    // --- Echange des clés et AES session ---
     CryptoCtx ctx;
     if (!crypto_init(ctx)) { std::cerr << "Crypto init failed!\n"; return 1; }
     std::vector<BYTE> my_pubkey, peer_pubkey;
     if (!export_rsa_pubkey(ctx, my_pubkey)) { std::cerr << "Erreur export clé publique\n"; return 1; }
     print_hex("Ma clé publique RSA", my_pubkey);
 
-    // Echange des clés publiques
     if (!send_blob(sock, my_pubkey)) { std::cerr << "Erreur envoi pubkey\n"; return 1; }
     if (!recv_blob(sock, peer_pubkey)) { std::cerr << "Erreur recv pubkey\n"; return 1; }
     print_hex("Clé publique RSA du peer", peer_pubkey);
@@ -259,11 +321,10 @@ int main() {
         std::cerr << "Erreur import peer pubkey\n"; return 1;
     }
 
-    // Echange de la clé de session AES
     std::vector<BYTE> session_blob;
     if (is_client) {
         if (!generate_aes_key(ctx)) { std::cerr << "Erreur génération clé AES\n"; return 1; }
-        print_aes_plain(ctx.hSession); // Affiche la clé AES brute (debug)
+        print_aes_plain(ctx.hSession);
         if (!export_aes_for_peer(ctx, session_blob)) { std::cerr << "Erreur export AES\n"; return 1; }
         print_hex("Ma clé AES session (SIMPLEBLOB)", session_blob);
         if (!send_blob(sock, session_blob)) { std::cerr << "Erreur envoi clé session\n"; return 1; }
@@ -274,20 +335,43 @@ int main() {
         if (!import_aes_from_peer(ctx, session_blob.data(), (DWORD)session_blob.size())) {
             std::cerr << "Erreur import clé session\n"; return 1;
         }
-        print_aes_plain(ctx.hSession); // Affiche la clé AES brute après import (debug)
+        print_aes_plain(ctx.hSession);
     }
 
     std::cout << "[Canal chiffré prêt]\n" << std::endl;
 
-    // --- Lancement du thread de réception ---
     std::thread recv_thread(receive_loop, sock, ctx.hSession);
 
-    // --- Boucle d'envoi chiffré ---
     std::string msg;
     while (true) {
         std::cout << "Vous: ";
         std::getline(std::cin, msg);
         if (msg.empty()) continue;
+        if (msg[0] == '/') {
+            if (msg == "/exit") break;
+            else if (msg == "/clear") { system("cls"); continue; }
+            else if (msg == "/whoami") {
+                std::cout << "[IP locale: " << ipstr << " | Port: " << my_port << "]\n";
+                continue;
+            }
+            else if (msg == "/help") {
+                std::cout << "/exit   : Quitter\n"
+                    "/clear  : Nettoyer l'écran\n"
+                    "/whoami : Affiche infos locales\n"
+                    "/sendfile <chemin> : Envoie un fichier chiffré\n";
+                continue;
+            }
+            else if (msg.size() >= 10 && msg.substr(0, 10) == "/sendfile ") {
+                std::string filepath = msg.substr(10);
+                send_file(sock, ctx.hSession, filepath);
+                continue;
+            }
+            else {
+                std::cout << "[Commande inconnue, tapez /help]\n";
+                continue;
+            }
+        }
+
         std::vector<BYTE> crypted;
         if (!aes_encrypt(ctx.hSession, msg, crypted)) {
             std::cerr << "Erreur chiffrement!\n";
@@ -297,10 +381,8 @@ int main() {
             std::cerr << "Erreur send!\n";
             break;
         }
-        if (msg == "exit") break;
     }
 
-    // --- Cleanup ---
     closesocket(sock);
     closesocket(server_fd);
     recv_thread.detach();
